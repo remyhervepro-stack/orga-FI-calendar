@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <title>Calendrier des Sessions (Grist)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <!-- FullCalendar (bundle global) -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/fullcalendar@6.1.20/index.global.min.css">
+  <script src="https://cdn.jsdelivr.net/npm/fullcalendar@6.1.20/index.global.min.js"></script>
+
+  <!-- Grist Widget API -->
+  <script src="https://docs.getgrist.com/grist-plugin-api.js"></script>
+
+  <style>
+    :root {
+      --fc-border-color: #e5e7eb;
+      --fc-neutral-bg-color: #f9fafb;
+    }
+    body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    #toolbar {
+      display: flex; gap: 8px; align-items: center; padding: 8px 12px;
+      border-bottom: 1px solid #e5e7eb; background: #fff; position: sticky; top:0; z-index:2;
+    }
+    #status { margin-left: auto; color: #6b7280; font-size: 12px; }
+    #calendar { height: calc(100vh - 46px); padding: 8px; }
+    .chip { display:inline-block; padding:2px 6px; border-radius:999px; font-size:11px; background:#eef2ff; color:#3730a3; margin-right:4px;}
+    .chip.room { background:#fef3c7; color:#92400e;}
+    .chip.grp { background:#ecfeff; color:#155e75;}
+    .chip.people { background:#f1f5f9; color:#0f172a;}
+    .legend { font-size:12px; color:#475569; }
+    .btn {
+      background:#111827; color:white; border:none; border-radius:8px; padding:6px 10px; cursor:pointer;
+    }
+    .btn.secondary { background:#e5e7eb; color:#111827; }
+  </style>
+</head>
+<body>
+  <div id="toolbar">
+    <button id="todayBtn" class="btn secondary">Aujourd’hui</button>
+    <button id="monthBtn" class="btn secondary">Mois</button>
+    <button id="weekBtn" class="btn secondary">Semaine</button>
+    <button id="dayBtn" class="btn secondary">Jour</button>
+    <div class="legend">Glisser-déposer pour déplacer/redimensionner · Double‑clic sur une plage pour créer</div>
+    <div id="status"></div>
+  </div>
+  <div id="calendar"></div>
+
+<script>
+(() => {
+  // --- Configuration de mapping (déclarée à Grist pour affichage dans le panneau latéral)
+  const columnsMappingOptions = [
+    { name: "title",        title: "Titre (affiché)",         optional: true,  type: "Text" },
+    { name: "start",        title: "Début",                   optional: false, type: "Date,DateTime" },
+    { name: "end",          title: "Fin",                     optional: true,  type: "Date,DateTime" },
+    { name: "durationMin",  title: "Durée (minutes)",         optional: true,  type: "Numeric" },
+    { name: "activity",     title: "Activité (texte ou Ref)", optional: true,  type: "Any" },
+    { name: "room",         title: "Salle (texte ou Ref)",    optional: true,  type: "Any" },
+    { name: "groups",       title: "Groupes (liste)",         optional: true,  type: "Choice,ChoiceList,RefList" },
+    { name: "intervenants", title: "Intervenants (liste)",    optional: true,  type: "ChoiceList,RefList" },
+    { name: "experts",      title: "Experts (liste)",         optional: true,  type: "ChoiceList,RefList" },
+    { name: "parcours",     title: "Parcours (texte ou Ref)", optional: true,  type: "Any" },
+  ];
+
+  // --- Options persistées (clé/valeur) dans le widget
+  const DEFAULTS = {
+    tableId: "Session",              // <— par défaut, ta table principale
+    firstDay: 1,                     // lundi
+    initialView: "timeGridWeek",
+    slotMinTime: "07:00:00",
+    slotMaxTime: "20:00:00",
+    allowWeekends: true,
+    editable: true                   // activer drag & drop si "full access"
+  };
+
+  let mappings = {};
+  let optionsKV = {};    // options persistées
+  let tableId = DEFAULTS.tableId;
+  let calendar, calendarEl, statusEl;
+  let hasFullAccess = false;
+
+  // --- Helpers ----------------------------------------------------------------
+  function toArray(x) {
+    if (!x) return [];
+    if (Array.isArray(x)) return x;
+    // ChoiceList peut venir comme chaîne séparée; on normalise en tableau
+    if (typeof x === 'string' && x.includes(',')) return x.split(',').map(s => s.trim());
+    return [x];
+  }
+  function asLabel(v) {
+    // Pour Ref/Choice/objets, Grist envoie déjà la valeur "affichée" si on passe par fetchSelectedTable (décodé)
+    // On force en string propre.
+    if (v == null) return "";
+    if (typeof v === 'object') return (v.label || v.name || v.id || JSON.stringify(v));
+    return String(v);
+  }
+  function conciseList(list, max = 3) {
+    const arr = toArray(list).map(asLabel).filter(Boolean);
+    if (arr.length <= max) return arr.join(", ");
+    return arr.slice(0, max).join(", ") + ` (+${arr.length - max})`;
+  }
+  function computeEnd(start, end, durationMin) {
+    const s = (start ? new Date(start) : null);
+    if (!s || isNaN(+s)) return null;
+    if (end) return new Date(end);
+    const d = Number(durationMin) || 60;
+    return new Date(s.getTime() + d * 60000);
+  }
+  function eventTitle(row) {
+    // 1) Titre explicite, sinon 2) Activité, sinon 3) fallback "Session #id"
+    const t = row[mappings.title] ?? row[mappings.activity];
+    return asLabel(t) || `Session #${row.id}`;
+  }
+  function eventSubtitles(row) {
+    const chips = [];
+    if (mappings.parcours && row[mappings.parcours]) {
+      chips.push(`<span class="chip">${asLabel(row[mappings.parcours])}</span>`);
+    }
+    if (mappings.room && row[mappings.room]) {
+      chips.push(`<span class="chip room">${asLabel(row[mappings.room])}</span>`);
+    }
+    if (mappings.groups && row[mappings.groups]) {
+      const g = conciseList(row[mappings.groups]);
+      if (g) chips.push(`<span class="chip grp">${g}</span>`);
+    }
+    const peopleParts = [];
+    if (mappings.intervenants && row[mappings.intervenants]) {
+      const s = conciseList(row[mappings.intervenants]);
+      if (s) peopleParts.push(s);
+    }
+    if (mappings.experts && row[mappings.experts]) {
+      const s = conciseList(row[mappings.experts]);
+      if (s) peopleParts.push(s);
+    }
+    if (peopleParts.length) {
+      chips.push(`<span class="chip people">${peopleParts.join(" · ")}</span>`);
+    }
+    return chips.join(" ");
+  }
+
+  function buildEvents(rows) {
+    return rows.map(row => {
+      const start = row[mappings.start];
+      const end   = row[mappings.end];
+      const dur   = mappings.durationMin ? row[mappings.durationMin] : null;
+      const startDate = start ? new Date(start) : null;
+      const endDate   = computeEnd(start, end, dur);
+      const roomLabel = mappings.room ? asLabel(row[mappings.room]) : "";
+      // couleur par salle (hash simple)
+      const bg = roomLabel ? `hsl(${(Math.abs(hashCode(roomLabel)) % 12)*30} 80% 85%)` : "#e0f2fe";
+      const border = roomLabel ? `hsl(${(Math.abs(hashCode(roomLabel)) % 12)*30} 60% 50%)` : "#38bdf8";
+
+      return {
+        id: String(row.id),  // id de la ligne Grist
+        title: eventTitle(row),
+        start: startDate,
+        end: endDate,
+        allDay: false,
+        extendedProps: {
+          row, roomLabel
+        },
+        backgroundColor: bg,
+        borderColor: border
+      };
+    }).filter(ev => ev.start && ev.end);
+  }
+
+  function hashCode(str) {
+    let h = 0; if (!str) return h;
+    for (let i=0;i<str.length;i++) h = ((h<<5)-h) + str.charCodeAt(i) | 0;
+    return h;
+  }
+
+  function setStatus(msg) { if (statusEl) statusEl.textContent = msg || ""; }
+
+  // --- Intégration Grist ------------------------------------------------------
+  async function initGrist() {
+    // Déclare le mapping de colonnes et demande l’accès nécessaire (lecture/écriture si édition)
+    grist.ready({
+      requiredAccess: DEFAULTS.editable ? 'full' : 'read table',
+      columns: columnsMappingOptions,
+      onEditOptions: openOptions // affiche notre config custom
+    });
+
+    // Récupère options persistées et mapping initial
+    optionsKV = await grist.getOptions?.() || {};
+    tableId = optionsKV.tableId || DEFAULTS.tableId;
+    hasFullAccess = (await grist.getAccessToken?.({readOnly:false}).then(()=>true).catch(()=>false));
+
+    // écoute options (quand l’utilisateur les change)
+    grist.onOptions?.(opts => {
+      optionsKV = opts || {};
+      tableId = optionsKV.tableId || DEFAULTS.tableId;
+      refresh();
+    });
+
+    // écoute des données de la table (changement de ligne/ajout/modif)
+    grist.onRecords(async () => {
+      // On recharge proprement l’ensemble de la table sélectionnée (décodée)
+      // pour simplifier la transformation → évite les formats internes.
+      const data = await grist.docApi.fetchSelectedTable();
+      // mappings est fourni par Grist (liens colonne<-→nom)
+      mappings = data.mappings || await grist.mapColumnNames?.() || {};
+      await renderFromTable(data);
+    });
+
+    // Ajuste la hauteur si besoin
+    grist.setHeight?.(document.body.scrollHeight);
+  }
+
+  // Petite fenêtre d’options (écriture côté widget via setOption)
+  async function openOptions() {
+    const current = await grist.getOptions?.() || {};
+    const table = prompt("ID de la table à modifier (par défaut: Session)", current.tableId || DEFAULTS.tableId);
+    if (table) {
+      await grist.setOption?.('tableId', table);
+      tableId = table;
+      refresh();
+    }
+  }
+
+  async function refresh() {
+    const data = await grist.docApi.fetchSelectedTable();
+    mappings = data.mappings || mappings;
+    await renderFromTable(data);
+  }
+
+  // Construit et injecte les événements dans FullCalendar
+  async function renderFromTable(data) {
+    const rows = (data?.records || data)  // selon version, fetchSelectedTable renvoie {records, ...}
+      ?.map?.(r => r) // déjà en objets {id, col1, col2...}
+      || unpackTable(data); // fallback si format colonnes->tableaux
+
+    const events = buildEvents(rows || []);
+    calendar.removeAllEvents();
+    calendar.addEventSource(events);
+    setStatus(`${events.length} évènement(s)`);
+  }
+
+  // fallback si fetchSelectedTable renvoie table au format colonnes->tableaux
+  function unpackTable(tbl) {
+    if (!tbl || !tbl.id) return [];
+    const count = tbl.id.length;
+    const fields = Object.keys(tbl).filter(k => k !== 'id' && k !== 'mappings');
+    const rows = [];
+    for (let i=0;i<count;i++) {
+      const row = { id: tbl.id[i] };
+      for (const f of fields) row[f] = tbl[f][i];
+      rows.push(row);
+    }
+    return rows;
+  }
+
+  // --- FullCalendar -----------------------------------------------------------
+  function initCalendar() {
+    calendarEl = document.getElementById('calendar');
+    statusEl = document.getElementById('status');
+
+    calendar = new FullCalendar.Calendar(calendarEl, {
+      initialView: (optionsKV.initialView || DEFAULTS.initialView),
+      firstDay: Number(optionsKV.firstDay ?? DEFAULTS.firstDay),
+      slotMinTime: optionsKV.slotMinTime || DEFAULTS.slotMinTime,
+      slotMaxTime: optionsKV.slotMaxTime || DEFAULTS.slotMaxTime,
+      weekends: (optionsKV.allowWeekends ?? DEFAULTS.allowWeekends),
+      nowIndicator: true,
+      headerToolbar: false,
+      height: '100%',
+      locale: 'fr',
+      selectable: true,
+      dayMaxEventRows: true,
+      editable: hasFullAccess && (optionsKV.editable ?? DEFAULTS.editable),
+      eventOverlap: true,
+      eventTimeFormat: { hour: '2-digit', minute: '2-digit', meridiem: false },
+
+      select: async (info) => {
+        if (!hasFullAccess) return;
+        // Création rapide : demande un titre (ou activité)
+        const title = prompt("Titre / Activité :", "");
+        if (!title) { calendar.unselect(); return; }
+        const fields = {};
+        if (mappings.title)   fields[mappings.title] = title;
+        if (mappings.start)   fields[mappings.start] = info.startStr;
+        if (mappings.end)     fields[mappings.end]   = info.endStr;
+        else if (mappings.durationMin) fields[mappings.durationMin] = Math.max(5, (info.end - info.start)/60000);
+
+        // Écrit dans Grist (AddRecord)
+        try {
+          await grist.docApi.applyUserActions?.([
+            ['AddRecord', tableId, null, fields]
+          ]);
+          setStatus('Évènement créé');
+        } catch (e) {
+          console.error(e);
+          alert("Impossible de créer la session (droits ou tableId ?). Ouvre les options et vérifie l’accès 'full'.");
+        }
+      },
+
+      eventDrop: async (info) => {
+        if (!hasFullAccess) return;
+        try {
+          const fields = {};
+          if (mappings.start) fields[mappings.start] = info.event.start.toISOString();
+          if (mappings.end)   fields[mappings.end]   = info.event.end?.toISOString();
+          else if (mappings.durationMin) fields[mappings.durationMin] =
+              Math.max(5, ((info.event.end - info.event.start) / 60000));
+          await grist.docApi.applyUserActions?.([
+            ['UpdateRecord', tableId, Number(info.event.id), fields]
+          ]);
+          setStatus('Horaire modifié');
+        } catch (e) {
+          console.error(e);
+          info.revert();
+        }
+      },
+
+      eventResize: async (info) => {
+        if (!hasFullAccess) return;
+        try {
+          const fields = {};
+          if (mappings.end)   fields[mappings.end] = info.event.end?.toISOString();
+          else if (mappings.durationMin) fields[mappings.durationMin] =
+              Math.max(5, ((info.event.end - info.event.start) / 60000));
+          await grist.docApi.applyUserActions?.([
+            ['UpdateRecord', tableId, Number(info.event.id), fields]
+          ]);
+          setStatus('Durée modifiée');
+        } catch (e) {
+          console.error(e);
+          info.revert();
+        }
+      },
+
+      eventClick: async (info) => {
+        // Met le focus sur la ligne dans Grist
+        const rowId = Number(info.event.id);
+        try {
+          await grist.setCursorPos?.({rowId});
+        } catch { /* non bloquant */ }
+      },
+
+      eventContent: (arg) => {
+        // Rendu riche : titre + puces (parcours / salle / groupes / intervenants+experts)
+        const row = arg.event.extendedProps.row;
+        const wrap = document.createElement('div');
+        const t = document.createElement('div');
+        t.textContent = arg.event.title;
+        t.style.fontWeight = 600;
+        t.style.fontSize = '12px';
+        const s = document.createElement('div');
+        s.innerHTML = eventSubtitles(row);
+        s.style.fontSize = '11px';
+        s.style.whiteSpace = 'nowrap';
+        s.style.overflow = 'hidden';
+        s.style.textOverflow = 'ellipsis';
+        wrap.appendChild(t); wrap.appendChild(s);
+        return { domNodes: [wrap] };
+      }
+    });
+
+    calendar.render();
+
+    // mini barre d’outils
+    document.getElementById('todayBtn').onclick = () => calendar.today();
+    document.getElementById('monthBtn').onclick = () => calendar.changeView('dayGridMonth');
+    document.getElementById('weekBtn').onclick  = () => calendar.changeView('timeGridWeek');
+    document.getElementById('dayBtn').onclick   = () => calendar.changeView('timeGridDay');
+  }
+
+  // --- Bootstrap --------------------------------------------------------------
+  window.addEventListener('DOMContentLoaded', async () => {
+    initCalendar();
+    await initGrist();
+  });
+})();
+</script>
+</body>
+</html>
